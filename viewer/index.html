@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<!-- The page the game runs in. It is served with odin.js, wgpu.js and
+     rexmundi.wasm beside it (tools/build_web.sh puts all four in
+     build/web), and fetches the map from assets/ under the same address.
+
+     Everything the game draws goes on the canvas. This page only sizes it,
+     fetches the map, answers the handful of things the game asks of a
+     browser (src/*_web.odin name them), and says what is wrong when a
+     browser cannot run it at all. The colours are the console's, so a
+     failure looks like the game and not like a browser error.
+
+     Opened with #timeline=<address> or ?watch, it is the viewer: someone
+     else's game, from a .rexmundi file fetched from that address, dropped
+     on the page or chosen, played back read-only (src/watch_web.odin). -->
+
+<html lang="en" style="height: 100%">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rex Mundi</title>
+<style>
+	:root {
+		--fill: #0b0e0c;
+		--line: #363e2c;
+		--accent: #acbe72;
+		--text: #e2e6d6;
+		--muted: #7e8872;
+	}
+	html, body { height: 100%; margin: 0; background: var(--fill); overflow: hidden; }
+	body {
+		color: var(--text);
+		font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+	}
+	#canvas { display: block; width: 100%; height: 100%; }
+	/* Over the canvas while the map is on its way, and instead of it when
+	   the browser cannot run the game at all. */
+	#notice {
+		position: fixed; inset: 0; display: flex; flex-direction: column;
+		align-items: center; justify-content: center; gap: 14px;
+		background: var(--fill); text-align: center; padding: 24px;
+	}
+	#notice[hidden] { display: none; }
+	h1 { margin: 0; font-size: 13px; letter-spacing: 2.2px; color: var(--muted); font-weight: 700; }
+	#what { margin: 0; max-width: 46ch; color: var(--muted); }
+	#what a { color: var(--accent); }
+	#bar { width: 260px; height: 3px; background: var(--line); }
+	#done { height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
+	/* The viewer's: what to do with a shared game, over the globe until
+	   one is open, and the reason when one is refused. */
+	#watch {
+		position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+		width: min(460px, calc(100% - 32px)); box-sizing: border-box;
+		padding: 24px 28px; background: rgba(11, 14, 12, .92);
+		border: 1px solid var(--line); text-align: left;
+	}
+	#watch[hidden] { display: none; }
+	#watch h2 { margin: 0 0 10px; font-size: 13px; letter-spacing: 2.2px; color: var(--accent); }
+	#watch p { margin: 0 0 12px; color: var(--muted); }
+	#watch a { color: var(--accent); }
+	#watch-why { color: #e67870 !important; }
+	#watch-why:empty { display: none; }
+	#watch label {
+		display: inline-block; margin-top: 4px; padding: 9px 16px; cursor: pointer;
+		border: 1px solid var(--accent); color: var(--text); font-weight: 600;
+		letter-spacing: 1.5px; font-size: 13px;
+	}
+	#watch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+	body.dragging #watch { border-color: var(--accent); }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="notice">
+	<h1>REX MUNDI</h1>
+	<p id="what">Loading…</p>
+	<div id="bar"><div id="done"></div></div>
+</div>
+<div id="watch" hidden>
+	<h2>WATCH A SHARED GAME</h2>
+	<p>A game of Rex Mundi, shared as a <code>.rexmundi</code> file: drop
+	one anywhere on this page, or choose one. Its history plays here, and
+	nothing is installed or sent anywhere.</p>
+	<p id="watch-why"></p>
+	<label>CHOOSE A FILE<input id="watch-file" type="file" accept=".rexmundi"></label>
+	<p style="margin: 16px 0 0">To play a game of your own,
+	<a href="https://rexmundi.alexisbouchez.com/" target="_top">get Rex Mundi</a>.</p>
+</div>
+
+<script src="odin.js"></script>
+<script src="wgpu.js"></script>
+<script>
+(async () => {
+	"use strict";
+	const notice = document.getElementById("notice");
+	const what = document.getElementById("what");
+	const done = document.getElementById("done");
+	const bar = document.getElementById("bar");
+	const canvas = document.getElementById("canvas");
+
+	const stop = (html) => {
+		notice.hidden = false;
+		bar.hidden = true;
+		what.innerHTML = html;
+	};
+	// Said before anything is fetched: a browser without WebGPU cannot draw
+	// the globe at all, and there is no second way of drawing it.
+	if (!navigator.gpu) {
+		stop("This browser has no WebGPU, which the map is drawn with.<br>" +
+		     "Chrome, Edge or Firefox 141 and later can run it — or " +
+		     "<a href=\"../\">download the game</a>, which needs no browser.");
+		return;
+	}
+
+	// 128 MB to start with, and room to grow: the baked map is most of it.
+	const memory = new WebAssembly.Memory({ initial: 2000, maximum: 65536 });
+	const mem = new odin.WasmMemoryInterface();
+	mem.setMemory(memory);
+	const webgpu = new odin.WebGPUInterface(mem);
+
+	// --- what the game asks of the browser -----------------------------------
+
+	const KEPT = "rexmundi:"; // how a save is named in local storage
+	let clipboard = "";       // the last text copied here or pasted in
+
+	// --- the viewer ------------------------------------------------------------
+
+	// Opened with #timeline=<address> or ?watch, the page shows someone
+	// else's game from a .rexmundi file, read-only, with no bridge and no
+	// saves of this browser's (src/watch_web.odin). The address is the
+	// rest of the fragment, encoded or not.
+	const timeline = (() => {
+		const found = location.hash.match(/(?:^#|&)timeline=(.*)$/);
+		if (!found) return null;
+		try { return decodeURIComponent(found[1]); } catch (e) { return found[1]; }
+	})();
+	const WATCH = timeline !== null || new URLSearchParams(location.search).has("watch");
+	const watch = document.getElementById("watch");
+	const watchWhy = document.getElementById("watch-why");
+	let handed = null;   // the file for the game, until it can be handed over
+	let running = false; // the game has its map and can take it
+	const watch_ask = (why) => {
+		watchWhy.textContent = why || "";
+		watch.hidden = false;
+	};
+	const watch_give = (data) => {
+		if (!running) { handed = data; return; }
+		watch.hidden = true;
+		hand_over("watch.rexmundi", data);
+		exports.rex_watch();
+	};
+	if (WATCH) {
+		const file = document.getElementById("watch-file");
+		const read = async (f) => {
+			if (f) watch_give(new Uint8Array(await f.arrayBuffer()));
+		};
+		file.addEventListener("change", () => read(file.files[0]));
+		window.addEventListener("dragover", (e) => {
+			e.preventDefault();
+			document.body.classList.add("dragging");
+		});
+		window.addEventListener("dragleave", () => document.body.classList.remove("dragging"));
+		window.addEventListener("drop", (e) => {
+			e.preventDefault();
+			document.body.classList.remove("dragging");
+			read(e.dataTransfer.files[0]);
+		});
+	}
+	// The file at the address, fetched while the map is. A host that does
+	// not let other sites read its files (no CORS header) cannot be
+	// fetched from here, which is what the reason says.
+	const fetch_timeline = async () => {
+		try {
+			const response = await fetch(timeline);
+			if (!response.ok) throw new Error(`the address answered ${response.status}`);
+			return new Uint8Array(await response.arrayBuffer());
+		} catch (e) {
+			watch_ask(`The game could not be fetched from ${timeline} (${e.message}). ` +
+				"Its host may not let other sites read it: download the file and drop it here instead.");
+			return null;
+		}
+	};
+	const fetching = timeline ? fetch_timeline() : null;
+
+	const str = (ptr, len) => mem.loadString(ptr, len);
+	const bytes = (ptr, len) => new Uint8Array(memory.buffer, ptr, len);
+	const put = (ptr, len, text) => {
+		// As much of `text` as there is room for, and how much that was.
+		const encoded = new TextEncoder().encode(text);
+		const size = Math.min(encoded.length, len);
+		if (len > 0) bytes(ptr, size).set(encoded.subarray(0, size));
+		return encoded.length;
+	};
+
+	// --- the bridge ------------------------------------------------------------
+
+	// rexmundi-agent serve, on this computer, lends the page the player's
+	// saves and their agent (agent/bridge.odin). It prints the address to
+	// open, with where it listens and its key after the #: the key is kept
+	// for this tab and taken out of the address bar, so a copied link does
+	// not carry it. Only an address on this computer is ever used.
+	const BRIDGE_KEPT = "rexmundi:bridge";
+	const bridge = (() => {
+		const given = new URLSearchParams(location.hash.slice(1));
+		// Someone else's game is only watched: nothing of it goes to the
+		// player's own computer.
+		if (WATCH) return null;
+		let found = { url: given.get("bridge"), token: given.get("token") };
+		if (found.url && found.token) {
+			try { sessionStorage.setItem(BRIDGE_KEPT, JSON.stringify(found)); } catch (e) {}
+			history.replaceState(null, "", location.pathname + location.search);
+		} else {
+			try { found = JSON.parse(sessionStorage.getItem(BRIDGE_KEPT)) || {}; } catch (e) { found = {}; }
+		}
+		if (!found.url || !found.token) return null;
+		if (!/^http:\/\/(127\.0\.0\.1|localhost):[0-9]+$/.test(found.url)) return null;
+		return found;
+	})();
+	let bridgeUp = false;
+	let bridgeReply = new Uint8Array(0);
+
+	// Synchronous, because the game reads its saves as if from a disk, in
+	// the middle of a frame. The answer comes from this computer.
+	const bridge_send = (method, path, body) => {
+		bridgeReply = new Uint8Array(0);
+		if (!bridge) return 0;
+		const xhr = new XMLHttpRequest();
+		try {
+			xhr.open(method, bridge.url + path, false);
+			xhr.setRequestHeader("Authorization", "Bearer " + bridge.token);
+			if (body) xhr.setRequestHeader("Content-Type", "application/json");
+			xhr.send(body || null);
+		} catch (e) {
+			return 0;
+		}
+		bridgeReply = new TextEncoder().encode(xhr.responseText);
+		return xhr.status;
+	};
+	if (bridge) {
+		bridgeUp = bridge_send("GET", "/api/hello") === 200;
+		if (!bridgeUp) console.warn("rexmundi: no bridge answers at " + bridge.url + "; the saves are this browser's own");
+	}
+
+	const rexmundi = {
+		bridge_ready: () => bridgeUp,
+		bridge_request: (mp, mn, pp, pn, bp, bn) =>
+			bridge_send(str(mp, mn), str(pp, pn), bn > 0 ? str(bp, bn) : null),
+		bridge_response: (p, n) => {
+			const size = Math.min(n, bridgeReply.length);
+			if (size > 0) bytes(p, size).set(bridgeReply.subarray(0, size));
+			return bridgeReply.length;
+		},
+
+		// Saves and settings, kept by the browser between visits.
+		store_size: (p, n) => {
+			const kept = localStorage.getItem(KEPT + str(p, n));
+			return kept === null ? -1 : atob(kept).length;
+		},
+		store_read: (p, n, bufPtr, bufLen) => {
+			const kept = atob(localStorage.getItem(KEPT + str(p, n)) || "");
+			const out = bytes(bufPtr, Math.min(bufLen, kept.length));
+			for (let i = 0; i < out.length; i++) out[i] = kept.charCodeAt(i);
+		},
+		store_write: (p, n, dataPtr, dataLen) => {
+			let binary = "";
+			for (const b of bytes(dataPtr, dataLen)) binary += String.fromCharCode(b);
+			try {
+				localStorage.setItem(KEPT + str(p, n), btoa(binary));
+			} catch (e) {
+				console.warn("nothing could be saved:", e);
+			}
+		},
+		store_list: (p, n, bufPtr, bufLen) => {
+			const prefix = KEPT + str(p, n);
+			const names = [];
+			for (let i = 0; i < localStorage.length; i++) {
+				const key = localStorage.key(i);
+				if (key.startsWith(prefix)) names.push(key.slice(prefix.length));
+			}
+			return put(bufPtr, bufLen, names.join("\n"));
+		},
+
+		// The pointer, the clipboard, the screen and the visitor's languages.
+		set_cursor: (p, n) => { canvas.style.cursor = str(p, n); },
+		clipboard_copy: (p, n) => {
+			clipboard = str(p, n);
+			navigator.clipboard?.writeText(clipboard).catch(() => {});
+		},
+		clipboard_size: () => new TextEncoder().encode(clipboard).length,
+		clipboard_read: (p, n) => put(p, n, clipboard),
+		go_fullscreen: (on) => {
+			if (on) document.documentElement.requestFullscreen?.().catch(() => {});
+			else document.exitFullscreen?.().catch(() => {});
+		},
+		languages: (p, n) => put(p, n, (navigator.languages || [navigator.language || "en"]).join("\n")),
+
+		// The notice over the canvas, which the game takes away once it is
+		// drawing, or turns into the reason it cannot.
+		notice_done: () => { notice.hidden = true; },
+		notice_failed: (p, n) => stop(str(p, n)),
+
+		// The viewer's (src/watch_web.odin).
+		watch_mode: () => WATCH,
+		watch_opened: (p, n) => {
+			watch.hidden = true;
+			document.title = str(p, n) + " · Rex Mundi";
+		},
+		watch_failed: (p, n) => watch_ask("This file could not be opened: " + str(p, n) + "."),
+
+		// Sharing, through the bridge (src/share_web.odin).
+		share_choose: () => picker.click(),
+		share_download: (np, nn, dp, dn) => {
+			const link = document.createElement("a");
+			link.href = URL.createObjectURL(new Blob([bytes(dp, dn).slice()]));
+			link.download = str(np, nn);
+			document.body.append(link);
+			link.click();
+			link.remove();
+			setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+		},
+	};
+
+	// The Load page's Import, with a bridge: the page's own file input
+	// stands in for the system's dialog, and a file dropped on the page
+	// comes the same way. The game hands it to the bridge, which imports it
+	// into the player's saves (agent/bridge.odin).
+	const picker = document.createElement("input");
+	picker.type = "file";
+	picker.accept = ".rexmundi";
+	picker.hidden = true;
+	document.body.append(picker);
+	const import_give = async (f) => {
+		if (!f || !running) return;
+		const data = new Uint8Array(await f.arrayBuffer());
+		const path = "import/" + f.name.replace(/[\/\\]/g, "_");
+		hand_over(path, data);
+		const name = new TextEncoder().encode(path);
+		const namePtr = exports.rex_alloc(name.length);
+		bytes(namePtr, name.length).set(name);
+		exports.rex_import(namePtr, name.length);
+	};
+	picker.addEventListener("change", () => {
+		import_give(picker.files[0]);
+		picker.value = ""; // the same file, chosen again, is a change too
+	});
+	if (bridgeUp) {
+		window.addEventListener("dragover", (e) => e.preventDefault());
+		window.addEventListener("drop", (e) => {
+			e.preventDefault();
+			import_give(e.dataTransfer.files[0]);
+		});
+	}
+
+	// A paste reaches the page, never the module: it is kept for the box
+	// that asks for it as it handles the same keystroke.
+	window.addEventListener("paste", (e) => {
+		clipboard = e.clipboardData.getData("text");
+	});
+
+	// --- the canvas ----------------------------------------------------------
+
+	let exports = null;
+	const resize = () => {
+		const ratio = window.devicePixelRatio || 1;
+		const width = canvas.clientWidth, height = canvas.clientHeight;
+		canvas.width = Math.round(width * ratio);
+		canvas.height = Math.round(height * ratio);
+		exports?.rex_resized?.(width, height, canvas.width, canvas.height);
+	};
+	window.addEventListener("resize", resize);
+	resize();
+
+	// --- the map -------------------------------------------------------------
+
+	// What the game reads before its first frame, and roughly how many MB
+	// each is over the wire, so the bar moves at an even pace rather than
+	// in the order they arrive.
+	//
+	// They come from the web bake, assets/web/ (`bake web`, some 25 MB,
+	// gzipped) when it is there, and otherwise from the desktop's assets/
+	// as they are (some 160 MB), which is what a clone that has not made
+	// one has. The game asks for each by its desktop name either way.
+	const ASSETS = [
+		["assets/fonts/Inter-SemiBold.ttf", 0.2, true],
+		["assets/fonts/Inter-Medium.ttf", 0.2, true],
+		["assets/fonts/Inter-MediumItalic.ttf", 0.2, true],
+		["assets/fonts/NotoSansSC-Medium.otf", 1.7, true],
+		["assets/flags.png", 1.1, false],
+		["assets/world.bin", 10.5, true],
+	];
+	// What it reads after: the imagery, which the globe draws without
+	// until it lands, streamed in a piece at a time (src/imagery_web.odin).
+	// The web bake keeps each cube's smallest level first, so the globe
+	// sharpens as they arrive.
+	const IMAGERY = ["assets/earth.cube", "assets/clouds.cube"];
+	let web_bake = true;
+
+	// The address a file has in the web bake, while there is one.
+	const baked = (path, packed) => path.replace(/^assets\//, "assets/web/") + (packed ? ".gz" : "");
+
+	// A gzipped file is unpacked here, unless the host already did (a
+	// Content-Encoding header), which the first two bytes tell.
+	const unpacked = async (data) => {
+		if (data.length < 2 || data[0] !== 0x1f || data[1] !== 0x8b) return data;
+		const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("gzip"));
+		return new Uint8Array(await new Response(stream).arrayBuffer());
+	};
+
+	const fetch_asset = async (path, packed) => {
+		if (web_bake) {
+			const response = await fetch(baked(path, packed));
+			if (response.ok) return await unpacked(new Uint8Array(await response.arrayBuffer()));
+			// Said once, by whichever of the files asked first.
+			if (web_bake) console.warn("rexmundi: no web bake at assets/web/; loading the desktop's assets");
+			web_bake = false;
+		}
+		const response = await fetch(path);
+		if (!response.ok) return null;
+		return new Uint8Array(await response.arrayBuffer());
+	};
+
+	// The same, a piece at a time: the first piece says whether it is
+	// gzipped, and is read again as the start of what is unpacked.
+	const stream_asset = async (path, each) => {
+		let response = web_bake ? await fetch(baked(path, true)) : null;
+		if (!response || !response.ok) response = await fetch(path);
+		if (!response.ok) throw new Error(`${path} answered ${response.status}`);
+		const reader = response.body.getReader();
+		const first = await reader.read();
+		if (first.done) return;
+		let body = new ReadableStream({
+			start(controller) { controller.enqueue(first.value); },
+			async pull(controller) {
+				const next = await reader.read();
+				if (next.done) controller.close();
+				else controller.enqueue(next.value);
+			},
+		});
+		if (first.value[0] === 0x1f && first.value[1] === 0x8b) {
+			body = body.pipeThrough(new DecompressionStream("gzip"));
+		}
+		for (const pieces = body.getReader();;) {
+			const next = await pieces.read();
+			if (next.done) return;
+			each(next.value);
+		}
+	};
+
+	// Memory for a name and for some bytes, filled, to hand to `take`.
+	const hand = (take, path, data) => {
+		const name = new TextEncoder().encode(path);
+		const namePtr = exports.rex_alloc(name.length);
+		bytes(namePtr, name.length).set(name);
+		const dataPtr = exports.rex_alloc(data.length);
+		if (data.length > 0) bytes(dataPtr, data.length).set(data);
+		take(namePtr, name.length, dataPtr, data.length);
+	};
+	const hand_over = (path, data) => hand(exports.rex_take_file, path, data);
+
+	// All at once, so a slow link waits on its bandwidth and not on each
+	// file's round trip in turn.
+	const fetch_all = async () => {
+		const total = ASSETS.reduce((sum, a) => sum + a[1], 0);
+		let far = 0;
+		const got = await Promise.all(ASSETS.map(async ([path, weight, packed]) => {
+			const data = await fetch_asset(path, packed);
+			if (!data) return path;
+			hand_over(path, data);
+			far += weight;
+			done.style.width = (far / total * 100).toFixed(1) + "%";
+			what.textContent = "Loading the map…";
+			return null;
+		}));
+		const missing = got.find((path) => path !== null);
+		if (missing) {
+			stop("The map is not where the game expected it: " + missing);
+			return false;
+		}
+		return true;
+	};
+
+	// Each cube as it comes, into the game, which puts each of its levels
+	// on the GPU once it is whole. Without them the globe stays plain,
+	// which is a reason to say so and not to stop.
+	const stream_imagery = () => {
+		for (const path of IMAGERY) {
+			stream_asset(path, (piece) => hand(exports.rex_take_part, path, piece))
+				.catch((e) => console.warn("rexmundi: the globe stays plain:", e.message));
+		}
+	};
+
+	// --- and away --------------------------------------------------------------
+
+	try {
+		await odin.runWasm("rexmundi.wasm", null, { wgpu: webgpu.getInterface(), rexmundi }, mem);
+		exports = mem.exports;
+		resize();
+		if (await fetch_all()) {
+			exports.rex_assets_ready();
+			stream_imagery();
+			running = true;
+			// The game takes a file on its next frame, once it has booted.
+			if (WATCH) {
+				const given = handed || (fetching && await fetching);
+				handed = null;
+				if (given) watch_give(given);
+				else if (!timeline) watch_ask("");
+			}
+		}
+	} catch (e) {
+		console.error(e);
+		stop("The game could not start: " + e);
+	}
+})();
+</script>
+</body>
+</html>
