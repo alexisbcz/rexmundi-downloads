@@ -9,9 +9,10 @@
      browser cannot run it at all. The colours are the console's, so a
      failure looks like the game and not like a browser error.
 
-     Opened with #timeline=<address> or ?watch, it is the viewer: someone
-     else's game, from a .rexmundi file fetched from that address, dropped
-     on the page or chosen, played back read-only (src/watch_web.odin). -->
+     Opened with #g=<a game>, #timeline=<address> or ?watch, it is the
+     viewer: someone else's game, carried in the link itself, or from a
+     .rexmundi file fetched from that address, dropped on the page or
+     chosen, played back read-only (src/watch_web.odin). -->
 
 <html lang="en" style="height: 100%">
 <head>
@@ -66,10 +67,22 @@
 	}
 	#watch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 	body.dragging #watch { border-color: var(--accent); }
+	/* The hidden box an input method types into, at the game's caret
+	   (src/input_web.odin). It is never seen and never takes a click; 16px
+	   keeps a phone from zooming in on it. */
+	#ime {
+		position: fixed; left: 0; top: 0; width: 1px; height: 22px;
+		margin: 0; padding: 0; border: 0; outline: 0; resize: none; overflow: hidden;
+		font-size: 16px; line-height: 22px; white-space: pre;
+		background: transparent; color: transparent; caret-color: transparent;
+		opacity: 0; pointer-events: none;
+	}
 </style>
 </head>
 <body>
 <canvas id="canvas"></canvas>
+<textarea id="ime" tabindex="-1" aria-hidden="true" autocomplete="off" autocorrect="off"
+	autocapitalize="off" spellcheck="false"></textarea>
 <div id="notice">
 	<h1>REX MUNDI</h1>
 	<p id="what">Loading…</p>
@@ -133,7 +146,13 @@
 		if (!found) return null;
 		try { return decodeURIComponent(found[1]); } catch (e) { return found[1]; }
 	})();
-	const WATCH = timeline !== null || new URLSearchParams(location.search).has("watch");
+	// Opened with #g=<a game>, the game is in the address itself.
+	const linked = (() => {
+		const found = location.hash.match(/(?:^#|&)g=([^&]*)/);
+		if (!found) return null;
+		try { return decodeURIComponent(found[1]); } catch (e) { return found[1]; }
+	})();
+	const WATCH = timeline !== null || linked !== null || new URLSearchParams(location.search).has("watch");
 	const watch = document.getElementById("watch");
 	const watchWhy = document.getElementById("watch-why");
 	let handed = null;   // the file for the game, until it can be handed over
@@ -179,7 +198,51 @@
 			return null;
 		}
 	};
-	const fetching = timeline ? fetch_timeline() : null;
+	// The game a link carries after #g= (game/link.odin): base64url, then
+	// a zlib stream, read with the browser's own DecompressionStream, which
+	// refuses a stream cut short. What comes out is a viewer timeline,
+	// which the game makes a timeline again. A link far longer than the
+	// game makes, or one that would inflate past the largest timeline, is
+	// stopped before it fills the page's memory.
+	const LINK_MOST = 128000;          // characters: twice game.LINK_MAX
+	const TIMELINE_MOST = 32 << 20;    // bytes: game.TIMELINE_MAX
+	const open_link = async () => {
+		const text = linked.replace(/[\s=]/g, "").replace(/-/g, "+").replace(/_/g, "/");
+		const refuse = (why) => {
+			watch_ask(`This link does not open a game: ${why}. Ask for the link again, or for the .rexmundi file, and drop that here.`);
+			return null;
+		};
+		if (!text) return refuse("it holds nothing after #g=");
+		if (text.length > LINK_MOST) return refuse("it is longer than any game's link");
+		let packed;
+		try {
+			packed = Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+		} catch (e) {
+			return refuse("it has characters a game's link never has");
+		}
+		try {
+			const reader = new Blob([packed]).stream().pipeThrough(new DecompressionStream("deflate")).getReader();
+			const pieces = [];
+			let size = 0;
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				size += value.length;
+				if (size > TIMELINE_MOST) {
+					reader.cancel();
+					return refuse("it holds more than any game");
+				}
+				pieces.push(value);
+			}
+			const view = new Uint8Array(size);
+			let at = 0;
+			for (const piece of pieces) { view.set(piece, at); at += piece.length; }
+			return view;
+		} catch (e) {
+			return refuse("it was cut short or changed on the way");
+		}
+	};
+	const fetching = timeline ? fetch_timeline() : linked !== null ? open_link() : null;
 
 	const str = (ptr, len) => mem.loadString(ptr, len);
 	const bytes = (ptr, len) => new Uint8Array(memory.buffer, ptr, len);
@@ -265,8 +328,10 @@
 			for (const b of bytes(dataPtr, dataLen)) binary += String.fromCharCode(b);
 			try {
 				localStorage.setItem(KEPT + str(p, n), btoa(binary));
+				return true;
 			} catch (e) {
 				console.warn("nothing could be saved:", e);
+				return false;
 			}
 		},
 		store_list: (p, n, bufPtr, bufLen) => {
@@ -293,10 +358,25 @@
 		},
 		languages: (p, n) => put(p, n, (navigator.languages || [navigator.language || "en"]).join("\n")),
 
+		// The hidden box, for a field with the keyboard (below).
+		ime_focus: (on) => ime_focus(on),
+		ime_place: (x, y, w, h) => {
+			ime.style.left = x + "px";
+			ime.style.top = y + "px";
+			ime.style.width = w + "px";
+			ime.style.height = h + "px";
+		},
+
 		// The notice over the canvas, which the game takes away once it is
 		// drawing, or turns into the reason it cannot.
 		notice_done: () => { notice.hidden = true; },
 		notice_failed: (p, n) => stop(str(p, n)),
+
+		// How the device holds the imagery (src/imagery_web.odin). The
+		// address can ask for a way a phone would take, ?imagery=etc2 or
+		// rgba8, to try it on a desktop.
+		imagery_wanted: () => Math.max(0, IMAGERY_WAYS.indexOf(new URLSearchParams(location.search).get("imagery"))),
+		imagery_chosen: (p, n) => imagery_known(str(p, n)),
 
 		// The viewer's (src/watch_web.odin).
 		watch_mode: () => WATCH,
@@ -304,7 +384,10 @@
 			watch.hidden = true;
 			document.title = str(p, n) + " · Rex Mundi";
 		},
-		watch_failed: (p, n) => watch_ask("This file could not be opened: " + str(p, n) + "."),
+		watch_failed: (p, n) => watch_ask("This game could not be opened: " + str(p, n) + "."),
+		// Out of the viewer, and out of the site's frame around it, to
+		// the game's own site.
+		open_address: (p, n) => { window.open(str(p, n), "_blank", "noopener"); },
 
 		// Sharing, through the bridge (src/share_web.odin).
 		share_choose: () => picker.click(),
@@ -354,6 +437,107 @@
 	// that asks for it as it handles the same keystroke.
 	window.addEventListener("paste", (e) => {
 		clipboard = e.clipboardData.getData("text");
+		// The hidden box would take it as well: the game's own paste,
+		// from what was just kept, is the one that counts.
+		if (e.target === ime) e.preventDefault();
+	});
+
+	// --- the hidden box --------------------------------------------------------
+
+	// A page hears keys, and an input method is not keys: Pinyin, a phone's
+	// keyboard and a dead key's accent compose in whatever text box has the
+	// focus, and the canvas is not one. So while a field in the game has
+	// the keyboard, this box has the focus, sits at the field's caret, and
+	// hands on what is composed and typed in it (src/input_web.odin), as
+	// SDL does on the desktop. The keys the game reads (Enter, Escape, the
+	// arrows, Tab) still reach it as keys. Without a field, the box lets
+	// go of the focus and the page has the keyboard as before.
+	//
+	// It keeps one space, with the caret after it, so a phone's Backspace
+	// has something to delete and says so; whatever lands in it is handed
+	// on and the space put back.
+	const ime = document.getElementById("ime");
+	let imeOn = false;     // a field in the game has the keyboard
+	let composing = false; // between compositionstart and compositionend
+	let composedFrom = 1;  // where the word in the making starts in the box
+	const ime_reset = () => {
+		ime.value = " ";
+		ime.setSelectionRange(1, 1);
+	};
+	const ime_focus = (on) => {
+		// Off first: a word given up as the box lets go is the field's no more.
+		imeOn = on;
+		if (on) {
+			ime_reset();
+			ime.focus({ preventScroll: true });
+		} else if (document.activeElement === ime) {
+			ime.blur();
+		}
+	};
+	const ime_give = (take, text, caret) => {
+		if (!imeOn || !exports) return;
+		const encoded = new TextEncoder().encode(text);
+		const ptr = exports.rex_alloc(encoded.length);
+		if (encoded.length > 0) bytes(ptr, encoded.length).set(encoded);
+		take(ptr, encoded.length, caret);
+	};
+	const ime_type = (text) => { if (text) ime_give(exports.rex_ime_text, text); };
+	// The word, and where the method's own caret is in it, in characters.
+	const ime_compose = (text, caret) => ime_give(exports.rex_ime_compose, text || "", caret);
+
+	ime.addEventListener("compositionstart", () => {
+		composing = true;
+		composedFrom = ime.selectionStart;
+	});
+	ime.addEventListener("compositionupdate", (e) => ime_compose(e.data, -1));
+	ime.addEventListener("compositionend", (e) => {
+		composing = false;
+		ime_compose("", -1);
+		ime_type(e.data);
+		ime_reset();
+	});
+	ime.addEventListener("input", (e) => {
+		if (composing) {
+			// The same word again, now with the box's caret in it.
+			const caret = Array.from(ime.value.slice(composedFrom, ime.selectionStart)).length;
+			ime_compose(e.data, caret);
+			return;
+		}
+		if (imeOn) {
+			switch (e.inputType) {
+			case "insertText": ime_type(e.data); break;
+			case "deleteContentBackward": exports.rex_ime_delete(false); break;
+			case "deleteContentForward": exports.rex_ime_delete(true); break;
+			}
+		}
+		// The rest come another way: a composition's end, a paste, a drop.
+		ime_reset();
+	});
+
+	// A click on the canvas would take the focus from the box. The game
+	// decides whether the click left the field, and says so with
+	// ime_focus(false).
+	canvas.addEventListener("mousedown", (e) => { if (imeOn) e.preventDefault(); });
+	// A phone opens its keyboard for a box focused in answer to a touch,
+	// and the game hears the touch a frame too late for that: a touch that
+	// ends while a field has the keyboard focuses the box again, in time.
+	window.addEventListener("pointerup", () => {
+		if (imeOn && document.activeElement !== ime) ime.focus({ preventScroll: true });
+	});
+	window.addEventListener("focus", () => {
+		if (imeOn) ime.focus({ preventScroll: true });
+	});
+
+	// Text dropped anywhere on the page goes to the field with the
+	// keyboard. A file dropped is the viewer's or the Load page's.
+	const dropped_text = (e) =>
+		imeOn && e.dataTransfer && e.dataTransfer.types.includes("text/plain") &&
+		!e.dataTransfer.types.includes("Files");
+	window.addEventListener("dragover", (e) => { if (dropped_text(e)) e.preventDefault(); });
+	window.addEventListener("drop", (e) => {
+		if (!dropped_text(e)) return;
+		e.preventDefault();
+		ime_type(e.dataTransfer.getData("text/plain"));
 	});
 
 	// --- the canvas ----------------------------------------------------------
@@ -375,7 +559,7 @@
 	// each is over the wire, so the bar moves at an even pace rather than
 	// in the order they arrive.
 	//
-	// They come from the web bake, assets/web/ (`bake web`, some 25 MB,
+	// They come from the web bake, assets/web/ (`bake web`, some 37 MB,
 	// gzipped) when it is there, and otherwise from the desktop's assets/
 	// as they are (some 160 MB), which is what a clone that has not made
 	// one has. The game asks for each by its desktop name either way.
@@ -385,6 +569,7 @@
 		["assets/fonts/Inter-MediumItalic.ttf", 0.2, true],
 		["assets/fonts/NotoSansSC-Medium.otf", 1.7, true],
 		["assets/flags.png", 1.1, false],
+		["assets/portraits.bin", 10.8, false],
 		["assets/world.bin", 10.5, true],
 	];
 	// What it reads after: the imagery, which the globe draws without
@@ -393,6 +578,12 @@
 	// sharpens as they arrive.
 	const IMAGERY = ["assets/earth.cube", "assets/clouds.cube"];
 	let web_bake = true;
+	// Which cubes to fetch is the game's to say, once it has a device that
+	// says which compressed formats it samples: the web bake keeps a set in
+	// DXT1 and a set in ETC2, and a device with neither unpacks the DXT1.
+	const IMAGERY_WAYS = [null, "dxt1", "etc2", "rgba8"];
+	let imagery_known;
+	const imagery_way = new Promise((resolve) => { imagery_known = resolve; });
 
 	// The address a file has in the web bake, while there is one.
 	const baked = (path, packed) => path.replace(/^assets\//, "assets/web/") + (packed ? ".gz" : "");
@@ -419,9 +610,15 @@
 	};
 
 	// The same, a piece at a time: the first piece says whether it is
-	// gzipped, and is read again as the start of what is unpacked.
-	const stream_asset = async (path, each) => {
-		let response = web_bake ? await fetch(baked(path, true)) : null;
+	// gzipped, and is read again as the start of what is unpacked. Each
+	// address in `addresses` is tried before the desktop's, in turn. Once
+	// `each` says it needs nothing more, the rest is not fetched.
+	const stream_asset = async (path, each, addresses) => {
+		let response = null;
+		for (const address of web_bake ? addresses : []) {
+			response = await fetch(address);
+			if (response.ok) break;
+		}
 		if (!response || !response.ok) response = await fetch(path);
 		if (!response.ok) throw new Error(`${path} answered ${response.status}`);
 		const reader = response.body.getReader();
@@ -434,6 +631,7 @@
 				if (next.done) controller.close();
 				else controller.enqueue(next.value);
 			},
+			cancel(why) { return reader.cancel(why); },
 		});
 		if (first.value[0] === 0x1f && first.value[1] === 0x8b) {
 			body = body.pipeThrough(new DecompressionStream("gzip"));
@@ -441,18 +639,22 @@
 		for (const pieces = body.getReader();;) {
 			const next = await pieces.read();
 			if (next.done) return;
-			each(next.value);
+			if (!each(next.value)) {
+				await pieces.cancel();
+				return;
+			}
 		}
 	};
 
-	// Memory for a name and for some bytes, filled, to hand to `take`.
+	// Memory for a name and for some bytes, filled, to hand to `take`, and
+	// what it answers.
 	const hand = (take, path, data) => {
 		const name = new TextEncoder().encode(path);
 		const namePtr = exports.rex_alloc(name.length);
 		bytes(namePtr, name.length).set(name);
 		const dataPtr = exports.rex_alloc(data.length);
 		if (data.length > 0) bytes(dataPtr, data.length).set(data);
-		take(namePtr, name.length, dataPtr, data.length);
+		return take(namePtr, name.length, dataPtr, data.length);
 	};
 	const hand_over = (path, data) => hand(exports.rex_take_file, path, data);
 
@@ -481,9 +683,15 @@
 	// Each cube as it comes, into the game, which puts each of its levels
 	// on the GPU once it is whole. Without them the globe stays plain,
 	// which is a reason to say so and not to stop.
-	const stream_imagery = () => {
+	//
+	// The ETC2 set is in assets/web/etc2. Without it the DXT1 is fetched,
+	// and the game unpacks it as it would for a device with neither.
+	const stream_imagery = async () => {
+		const way = await imagery_way;
 		for (const path of IMAGERY) {
-			stream_asset(path, (piece) => hand(exports.rex_take_part, path, piece))
+			const addresses = [baked(path, true)];
+			if (way === "etc2") addresses.unshift(baked(path.replace(/^assets\//, "assets/etc2/"), true));
+			stream_asset(path, (piece) => hand(exports.rex_take_part, path, piece), addresses)
 				.catch((e) => console.warn("rexmundi: the globe stays plain:", e.message));
 		}
 	};
@@ -503,7 +711,7 @@
 				const given = handed || (fetching && await fetching);
 				handed = null;
 				if (given) watch_give(given);
-				else if (!timeline) watch_ask("");
+				else if (!timeline && linked === null) watch_ask("");
 			}
 		}
 	} catch (e) {
